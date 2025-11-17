@@ -183,7 +183,7 @@ def plot_floorplan(df_rooms, df_workstations, highlight_ws_id=None, highlight_ro
 
 # ---------------- Streamlit UI ---------------- #
 
-st.title("🏢 Meeting Room Selector with Floor Plan")
+st.title("🏢 Smart Meeting Room Selector ")
 
 workstation_id = st.text_input("Workstation ID", "WS-11")
 required_capacity = st.number_input("Required Capacity", min_value=1, value=4)
@@ -209,8 +209,20 @@ if st.button("Find Room"):
         st.error(result["decision_explanation"])
     else:
         st.success("✅ Suggested Meeting Room:")
-        st.write(result["selected_room"])
-        st.write(f"**Explanation:** {result['decision_explanation']}")
+        if result["selected_room"]:
+            room = result["selected_room"]
+            plain_text = (
+                f"Meeting Room ID: {room['id']} \n"
+                f"Meeting Room Name: {room['name']} \n"
+                f"Capacity: {room['capacity']}\n"
+                f"Distance: {room['distance_m']} meters\n"
+                f"Utilization: {room['utilization_pct']}%\n"
+                f"Available: {room['available']}\n\n"
+                f"Explanation: {result['decision_explanation']}"
+            )
+            st.text(plain_text)
+        #st.write(result["selected_room"])
+        #st.write(f"**Explanation:** {result['decision_explanation']}")
 
         # Highlight selected room and workstation on floor plan
         highlight_room = rooms[rooms["id"] == result["selected_room"]["id"]].iloc[0]
