@@ -7,3 +7,4 @@ streamlit==1.38.0
 typing-extensions==4.12.2
 python-dateutil==2.9.0.post0
 pytz==2024.2
+portalocker==2.10.1

@@ -54,6 +54,45 @@ room_logger = setup_room_selection_logger()
 
 # ---------------- Utility Functions ---------------- #
 
+def ensure_string_columns(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].astype(str).fillna('')
+    return df
+
+@st.cache_data(show_spinner=False)
+def load_rooms(path: str) -> pd.DataFrame:
+    """Load and preprocess rooms data with caching and error handling."""
+    try:
+        df = pd.read_csv(path)
+        df = compute_room_centers(normalize_columns(df))
+        return df
+    except Exception as e:
+        st.error(f"Failed to load meeting rooms data: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(show_spinner=False)
+def load_workstations(path: str) -> pd.DataFrame:
+    """Load and preprocess workstations data with caching and error handling."""
+    try:
+        df = pd.read_csv(path)
+        return normalize_columns(df)
+    except Exception as e:
+        st.error(f"Failed to load workstations data: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(show_spinner=False)
+def load_bookings(path: str) -> pd.DataFrame:
+    """Load and preprocess bookings data with caching and error handling."""
+    try:
+        df = pd.read_csv(path)
+        df = preprocess_bookings_raw(normalize_columns(df))
+        df = ensure_string_columns(df, ['workstation_id','room_id','start_time','end_time','date','booking_id'])
+        return df
+    except Exception as e:
+        st.error(f"Failed to load bookings data: {e}")
+        return pd.DataFrame()
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip().lower() for c in df.columns]
     return df
@@ -71,12 +110,17 @@ def preprocess_bookings_raw(bookings: pd.DataFrame) -> pd.DataFrame:
     # Normalize column names
     b.columns = [c.strip().lower() for c in b.columns]
 
-    # Normalize booleans (if strings TRUE/FALSE)
+    # Normalize booleans robustly (avoid FutureWarning on fillna downcasting)
     bool_cols = ["is_recurring", "has_catering", "has_av_equipment", "cancelled", "no_show"]
     for c in bool_cols:
         if c in b.columns:
-            b[c] = b[c].astype(str).str.upper().map({"TRUE": True, "FALSE": False})
-            b[c] = b[c].fillna(False)
+            # Convert any representation to standardized boolean
+            raw = b[c]
+            # Treat explicit True/False strings, 1/0, and actual bools
+            upper = raw.astype(str).str.strip().str.upper()
+            mapped = upper.map({"TRUE": True, "FALSE": False, "1": True, "0": False})
+            # Where mapping failed, default to False
+            b[c] = mapped.fillna(False).astype(bool)
 
     # Coerce duration to numeric and filter invalid
     if "duration_minutes" in b.columns:
@@ -286,11 +330,12 @@ def select_room_strict(
     duration_minutes: int,
     utilization_threshold: float = 0.65,
     distance_tolerance_m: float = 5.0,
-    enable_logging: bool = False
+    enable_logging: bool = False,
+    log_level: str = "INFO"
 ) -> Dict:
-    # Configure logger for this session
+    # Configure logger for this session (now respects log_level)
     global room_logger
-    room_logger = setup_room_selection_logger(enable_logging)
+    room_logger = setup_room_selection_logger(enable_logging, log_level)
     
     room_logger.info(f"Starting room selection process:")
     room_logger.info(f"   Meeting: {meeting_date} at {start_time} for {duration_minutes}min")
@@ -538,6 +583,12 @@ def plot_floorplan(df_rooms, df_workstations, highlight_ws_id=None, highlight_ro
 # ---------------- Streamlit UI ---------------- #
 
 st.title("🏢 Smart Meeting Room Selector ")
+# Prevent duplicate booking actions rendering in same run
+if 'from_find_room_click' not in st.session_state:
+    st.session_state.from_find_room_click = False
+elif st.session_state.from_find_room_click:
+    # Reset flag at start of a new rerun so persistent section can appear
+    st.session_state.from_find_room_click = False
 
 def generate_time_options():
     times = []
@@ -645,7 +696,6 @@ with st.sidebar:
         value=False,
         help="Show detailed reasoning for room selection decisions in console/logs"
     )
-    
     if enable_detailed_logging:
         log_level = st.selectbox(
             "Log Level",
@@ -655,6 +705,22 @@ with st.sidebar:
         )
     else:
         log_level = "INFO"
+    utilization_threshold = st.slider(
+        "Utilization Threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.65,
+        step=0.05,
+        help="Max utilization allowed for nearest room before searching alternatives"
+    )
+    distance_tolerance_m = st.number_input(
+        "Distance Tolerance (m)",
+        min_value=0.0,
+        max_value=50.0,
+        value=5.0,
+        step=0.5,
+        help="Extra distance tolerance when looking for lower-utilization alternatives"
+    )
 
 col1, col2 = st.columns([2, 1])
 
@@ -766,6 +832,262 @@ if start_time and end_time and end_time != start_time:
 else:
     st.warning("Please select valid start and end times!")
 
+import uuid
+# NOTE: portalocker optional; add to requirements.txt for robust cross-process locking.
+try:
+    import portalocker  # type: ignore
+except ImportError:
+    portalocker = None  # Fallback if not installed yet
+
+BOOKING_LOCK_FILE = os.path.join(_d, "bookings.lock")
+
+def _acquire_lock(path: str):
+    """Acquire an exclusive lock. Uses portalocker if available; otherwise manual file lock."""
+    if portalocker:
+        return portalocker.Lock(path, timeout=5)
+    # Fallback simple context manager
+    class _BasicLock:
+        def __enter__(self_inner):
+            # Busy wait up to 5 seconds
+            import time
+            start = time.time()
+            while os.path.exists(path) and time.time() - start < 5:
+                time.sleep(0.1)
+            # Create lock marker
+            with open(path, 'w') as f:  # create marker file
+                f.write(str(datetime.utcnow()))
+            return self_inner
+        def __exit__(self_inner, exc_type, exc, tb):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    return _BasicLock()
+
+def _compute_end_time(start_time: str, duration_minutes: int) -> str:
+    h, m = map(int, start_time.split(':'))
+    total = h*60 + m + duration_minutes
+    total %= (24*60)
+    return f"{total//60:02d}:{total%60:02d}"
+
+def _time_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    return a_start < b_end and b_start < a_end
+
+def workstation_has_conflict(bookings: pd.DataFrame, workstation_id: str, meeting_date: str, start_time: str, duration_minutes: int) -> Tuple[bool, pd.DataFrame]:
+    """Return True and conflicting rows if workstation already booked for overlapping slot."""
+    if bookings.empty or 'workstation_id' not in bookings.columns:
+        return False, pd.DataFrame()
+    bookings = ensure_string_columns(bookings, ['workstation_id','start_time','end_time','date'])
+    start_h, start_m = map(int, start_time.split(':'))
+    req_start = start_h*60 + start_m
+    req_end = req_start + duration_minutes
+    day_ws = bookings[(bookings['date'] == meeting_date) & (bookings['workstation_id'].str.upper() == workstation_id.upper())].copy()
+    if day_ws.empty:
+        return False, pd.DataFrame()
+    # Prepare minutes (use .loc to avoid SettingWithCopyWarning)
+    if 'start_minutes' not in day_ws.columns:
+        day_ws.loc[:, 'start_minutes'] = day_ws['start_time'].str.split(':').str[0].astype(int)*60 + day_ws['start_time'].str.split(':').str[1].astype(int)
+    if 'end_minutes' not in day_ws.columns:
+        if 'duration_minutes' in day_ws.columns:
+            day_ws.loc[:, 'end_minutes'] = day_ws['start_minutes'] + day_ws['duration_minutes']
+        elif 'end_time' in day_ws.columns:
+            day_ws.loc[:, 'end_minutes'] = day_ws['end_time'].str.split(':').str[0].astype(int)*60 + day_ws['end_time'].str.split(':').str[1].astype(int)
+        else:
+            day_ws.loc[:, 'end_minutes'] = day_ws['start_minutes']  # fallback
+    conflicts = day_ws[day_ws.apply(lambda r: _time_overlap(req_start, req_end, r['start_minutes'], r['end_minutes']), axis=1)]
+    return not conflicts.empty, conflicts
+
+def room_has_conflict(bookings: pd.DataFrame, room_id: str, meeting_date: str, start_time: str, duration_minutes: int) -> bool:
+    """Check if a room already has an overlapping booking for given window."""
+    if bookings.empty or 'room_id' not in bookings.columns:
+        return False
+    bookings = ensure_string_columns(bookings, ['room_id','start_time','end_time','date'])
+    s_h, s_m = map(int, start_time.split(':'))
+    req_start = s_h*60 + s_m
+    req_end = req_start + duration_minutes
+    room_day = bookings[(bookings['date'] == meeting_date) & (bookings['room_id'].astype(str) == str(room_id))].copy()
+    if room_day.empty:
+        return False
+    if 'start_minutes' not in room_day.columns:
+        room_day.loc[:, 'start_minutes'] = room_day['start_time'].str.split(':').str[0].astype(int)*60 + room_day['start_time'].str.split(':').str[1].astype(int)
+    if 'end_minutes' not in room_day.columns:
+        if 'duration_minutes' in room_day.columns:
+            room_day.loc[:, 'end_minutes'] = room_day['start_minutes'] + pd.to_numeric(room_day['duration_minutes'], errors='coerce').fillna(0).astype(int)
+        elif 'end_time' in room_day.columns:
+            room_day.loc[:, 'end_minutes'] = room_day['end_time'].str.split(':').str[0].astype(int)*60 + room_day['end_time'].str.split(':').str[1].astype(int)
+        else:
+            room_day.loc[:, 'end_minutes'] = room_day['start_minutes']
+    return room_day.apply(lambda r: _time_overlap(req_start, req_end, r['start_minutes'], r['end_minutes']), axis=1).any()
+
+def generate_sequential_booking_id(existing: pd.DataFrame) -> str:
+    """Generate next sequential booking_id in format BK-000001 based on existing DataFrame."""
+    prefix = "BK-"
+    if 'booking_id' not in existing.columns or existing.empty:
+        return f"{prefix}000001"
+    nums = []
+    for bid in existing['booking_id'].astype(str):
+        if bid.startswith(prefix):
+            tail = bid[len(prefix):]
+            if tail.isdigit():
+                nums.append(int(tail))
+    next_num = (max(nums) + 1) if nums else 1
+    return f"{prefix}{next_num:06d}"
+
+def append_booking_record(bookings_path: str, room_id: str, workstation_id: str, meeting_date: str, start_time: str, duration_minutes: int, required_capacity: int, source: str = 'app') -> Tuple[bool, str]:
+    """Append a booking row with locking. Returns (success, message)."""
+    try:
+        with _acquire_lock(BOOKING_LOCK_FILE):
+            try:
+                existing = pd.read_csv(bookings_path)
+            except Exception as e:
+                return False, f"Failed to read bookings file: {e}"
+            existing = ensure_string_columns(existing, ['workstation_id','room_id','date','start_time','end_time','booking_id'])
+            for col, default in [
+                ('workstation_id', ''),
+                ('booking_created_at', ''),
+                ('booking_source', '')
+            ]:
+                if col not in existing.columns:
+                    existing[col] = default
+            # Sequential booking id generation replaces UUID usage
+            booking_id = generate_sequential_booking_id(existing)
+            end_time = _compute_end_time(start_time, duration_minutes)
+            # Room conflict check (simplified access)
+            if 'room_id' in existing.columns:
+                room_day = existing[(existing['room_id'].astype(str) == str(room_id)) & (existing['date'] == meeting_date)].copy()
+            else:
+                room_day = pd.DataFrame()
+            def _row_minutes(df: pd.DataFrame) -> pd.DataFrame:
+                df = df.copy()
+                if df.empty:
+                    return df
+                if 'start_minutes' not in df.columns:
+                    df.loc[:, 'start_minutes'] = df['start_time'].str.split(':').str[0].astype(int)*60 + df['start_time'].str.split(':').str[1].astype(int)
+                if 'end_minutes' not in df.columns:
+                    if 'duration_minutes' in df.columns:
+                        df.loc[:, 'end_minutes'] = df['start_minutes'] + pd.to_numeric(df['duration_minutes'], errors='coerce').fillna(0).astype(int)
+                    elif 'end_time' in df.columns:
+                        df.loc[:, 'end_minutes'] = df['end_time'].str.split(':').str[0].astype(int)*60 + df['end_time'].str.split(':').str[1].astype(int)
+                    else:
+                        df.loc[:, 'end_minutes'] = df['start_minutes']
+                return df
+            room_day = _row_minutes(room_day)
+            s_h, s_m = map(int, start_time.split(':'))
+            req_start = s_h*60 + s_m
+            req_end = req_start + duration_minutes
+            if not room_day.empty:
+                room_conflict = room_day[room_day.apply(lambda r: _time_overlap(req_start, req_end, r['start_minutes'], r['end_minutes']), axis=1)]
+                if not room_conflict.empty:
+                    return False, f"Room {room_id} already booked for overlapping time. Conflicts: {room_conflict['booking_id'].tolist()}"
+            if 'workstation_id' in existing.columns:
+                ws_day = existing[(existing['date'] == meeting_date) & (existing['workstation_id'].str.upper() == workstation_id.upper())].copy()
+                ws_day = _row_minutes(ws_day)
+                if not ws_day.empty:
+                    ws_conflict = ws_day[ws_day.apply(lambda r: _time_overlap(req_start, req_end, r['start_minutes'], r['end_minutes']), axis=1)]
+                    if not ws_conflict.empty:
+                        return False, f"Workstation {workstation_id} already has a booking in this slot."
+            new_row = {
+                'booking_id': booking_id,
+                'room_id': room_id,
+                'date': meeting_date,
+                'start_time': start_time,
+                'duration_minutes': duration_minutes,
+                'end_time': end_time,
+                'booked_attendees': required_capacity,
+                'actual_attendees': 0,
+                'booking_lead_time_hours': 0,
+                'cancelled': False,
+                'no_show': False,
+                'workstation_id': workstation_id,
+                'booking_created_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'booking_source': source
+            }
+            for k in new_row.keys():
+                if k not in existing.columns:
+                    existing[k] = pd.NA
+            existing = pd.concat([existing, pd.DataFrame([new_row])], ignore_index=True)
+            tmp_path = bookings_path + '.tmp'
+            existing.to_csv(tmp_path, index=False)
+            os.replace(tmp_path, bookings_path)
+        return True, f"Booking created (ID: {booking_id})"
+    except Exception as e:
+        return False, f"Failed to create booking: {e}"
+
+# --- Helper to render booking actions BEFORE floor plan ---
+def render_booking_actions(params: Dict):
+    """Render booking actions UI (conflict status + booking button) before floor plan."""
+    # Live reload for up-to-date conflicts
+    bookings_live = load_bookings(BOOKINGS_CSV)
+    ws_conflict, ws_conflict_rows = workstation_has_conflict(
+        bookings_live,
+        params['workstation_id'],
+        params['meeting_date'],
+        params['start_time'],
+        params['duration_minutes']
+    )
+    room_conflict = room_has_conflict(
+        bookings_live,
+        params['room_id'],
+        params['meeting_date'],
+        params['start_time'],
+        params['duration_minutes']
+    )
+    # Style only booking actions button (scoped CSS)
+    st.markdown(
+        """
+        <style>
+        .booking-actions .stButton > button {
+            background-color:#d32f2f;
+            color:#ffffff;
+            font-weight:600;
+            border:none;
+        }
+        .booking-actions .stButton > button:hover {
+            background-color:#b71c1c;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    with st.container():
+        st.subheader("Booking Actions")
+        conflict_msgs = []
+        if ws_conflict:
+            conflict_msgs.append(f"Workstation {params['workstation_id']} already booked for this slot.")
+        if room_conflict:
+            conflict_msgs.append(f"Room {params['room_id']} is no longer available (recent booking conflict).")
+        if conflict_msgs:
+            st.warning(" \n".join(conflict_msgs))
+            if ws_conflict_rows is not None and not ws_conflict_rows.empty:
+                st.info(f"Existing booking IDs: {ws_conflict_rows.get('booking_id', pd.Series([])).tolist()}")
+        else:
+            disabled_flag = st.session_state.get('booking_success', False)
+            # Scoped div for CSS
+            with st.container():
+                st.markdown('<div class="booking-actions">', unsafe_allow_html=True)
+                unique_btn_key = f"book_meeting_room_{params['room_id']}_{params['meeting_date']}_{params['start_time']}"
+                if st.button("Book Meeting Room", disabled=disabled_flag, key=unique_btn_key):
+                    success, msg = append_booking_record(
+                        BOOKINGS_CSV,
+                        params['room_id'],
+                        params['workstation_id'],
+                        params['meeting_date'],
+                        params['start_time'],
+                        params['duration_minutes'],
+                        params['required_capacity']
+                    )
+                    if success:
+                        st.success(msg)
+                        st.session_state.booking_success = True
+                        # Invalidate cached bookings so subsequent conflict checks are fresh
+                        load_bookings.clear()
+                    else:
+                        st.error(msg)
+                st.markdown('</div>', unsafe_allow_html=True)
+            if disabled_flag:
+                st.info("Booking already completed for this selection.")
+
 if st.button("Find Room"):
     if start_time >= end_time:
         st.error("End time must be after start time!")
@@ -773,51 +1095,121 @@ if st.button("Find Room"):
         st.error("Please select a valid weekday (Monday-Friday) before proceeding.")
     else:
         duration_minutes, _ = calculate_duration(start_time, end_time)
-        
-        rooms = pd.read_csv(MEETING_ROOMS_CSV)
-        workstations = pd.read_csv(WORKSTATIONS_CSV)
-        bookings = pd.read_csv(BOOKINGS_CSV)
-
-        rooms = compute_room_centers(normalize_columns(rooms))
-        workstations = normalize_columns(workstations)        # PREPROCESS BOOKINGS HERE (dedupe + invalid window cleanup)
-        bookings = preprocess_bookings_raw(normalize_columns(bookings))
-
-        assert {"start_dt", "end_dt", "date", "start_time"}.issubset(bookings.columns)
-        assert bookings["duration_minutes"].gt(0).all()
-        assert not bookings["booking_id"].duplicated().any()
-
-        validation_result = validate_inputs(rooms, workstations, workstation_id, required_capacity, meeting_date, start_time, duration_minutes)
-        if not validation_result["valid"]:
-            st.error("Input validation failed: " + "; ".join(validation_result["errors"]))
+        rooms = load_rooms(MEETING_ROOMS_CSV)
+        workstations = load_workstations(WORKSTATIONS_CSV)
+        bookings = load_bookings(BOOKINGS_CSV)
+        if rooms.empty or workstations.empty or bookings.empty:
+            st.error("Data loading failed; cannot proceed with room selection.")
         else:
-            # Show logging status if enabled
-            if enable_detailed_logging:
-                st.info(f"Detailed logging enabled (Level: {log_level}) - Check console for reasoning details")
-            
-            result = select_room_strict(
-                rooms, workstations, bookings,
-                required_capacity, workstation_id,
-                meeting_date, start_time, duration_minutes,
-                enable_logging=enable_detailed_logging
-            )
-
-            if result["selected_room"] is None:
-                st.error(result["decision_explanation"])
+            try:
+                assert {"start_dt", "end_dt", "date", "start_time"}.issubset(bookings.columns)
+                assert bookings["duration_minutes"].gt(0).all()
+                assert not bookings["booking_id"].duplicated().any()
+            except AssertionError as e:
+                st.error(f"Data integrity check failed: {e}")
             else:
-                st.success("Suggested Meeting Room:")
-                if result["selected_room"]:
-                    room = result["selected_room"]
-                    plain_text = (
-                        f"Meeting Room ID: {room['id']} \n"
-                        f"Meeting Room Name: {room['name']} \n"
-                        f"Capacity: {room['capacity']}\n"
-                        f"Distance: {room['distance_m']} meters\n"
-                        f"Utilization: {room['utilization_pct']}%\n"
-                        f"Available: {room['available']}\n\n"
-                        f"Explanation: {result['decision_explanation']}"
+                validation_result = validate_inputs(rooms, workstations, workstation_id, required_capacity, meeting_date, start_time, duration_minutes)
+                if not validation_result["valid"]:
+                    st.error("Input validation failed: " + "; ".join(validation_result["errors"]))
+                else:
+                    # NEW: Workstation conflict short-circuit BEFORE room suggestion
+                    ws_conflict_now, ws_conflict_rows_now = workstation_has_conflict(
+                        bookings,
+                        workstation_id,
+                        meeting_date,
+                        start_time,
+                        duration_minutes
                     )
-                    st.text(plain_text)
+                    if ws_conflict_now and not ws_conflict_rows_now.empty:
+                        st.warning(f"Workstation {workstation_id} already booked for this slot. Existing booking(s) shown below.")
+                        # Show existing booking details table for this workstation/time window
+                        display_cols = [c for c in ["booking_id","room_id","date","start_time","end_time","duration_minutes","booked_attendees"] if c in ws_conflict_rows_now.columns]
+                        # Ensure end_time present for legacy rows
+                        if "end_time" not in ws_conflict_rows_now.columns:
+                            ws_conflict_rows_now = ws_conflict_rows_now.copy()
+                            ws_conflict_rows_now["end_time"] = ws_conflict_rows_now.apply(lambda r: _compute_end_time(r["start_time"], int(r["duration_minutes"])) if pd.notna(r.get("duration_minutes")) else "", axis=1)
+                        st.dataframe(ws_conflict_rows_now[display_cols].sort_values("start_time"))
+                        # Highlight first conflicting room on floorplan if available
+                        conflict_room_id = ws_conflict_rows_now.iloc[0]["room_id"] if "room_id" in ws_conflict_rows_now.columns else None
+                        highlight_room_df = rooms[rooms["id"] == conflict_room_id]
+                        if not highlight_room_df.empty:
+                            highlight_room = highlight_room_df.iloc[0]
+                        else:
+                            highlight_room = None
+                        plot_floorplan(rooms, workstations, highlight_ws_id=workstation_id, highlight_room=highlight_room)
+                        # Clear any previous selection & prevent booking actions
+                        st.session_state.pop('selected_room_result', None)
+                        st.session_state.pop('selection_params', None)
+                        st.session_state.pop('booking_success', None)
+                        st.session_state.from_find_room_click = True  # suppress persistent section
+                    else:
+                        if enable_detailed_logging:
+                            st.info(f"Detailed logging enabled (Level: {log_level}) - Check console for reasoning details")
+                        result = select_room_strict(
+                            rooms, workstations, bookings,
+                            required_capacity, workstation_id,
+                            meeting_date, start_time, duration_minutes,
+                            utilization_threshold=utilization_threshold,
+                            distance_tolerance_m=distance_tolerance_m,
+                            enable_logging=enable_detailed_logging,
+                            log_level=log_level
+                        )
 
-                # Highlight selected room and workstation on floor plan
-                highlight_room = rooms[rooms["id"] == result["selected_room"]["id"]].iloc[0]
-                plot_floorplan(rooms, workstations, highlight_ws_id=workstation_id, highlight_room=highlight_room)
+                        if result["selected_room"] is None:
+                            st.error(result["decision_explanation"])
+                            st.session_state.pop('selected_room_result', None)
+                            st.session_state.pop('selection_params', None)
+                        else:
+                            st.success("Suggested Meeting Room:")
+                            if result["selected_room"]:
+                                room = result["selected_room"]
+                                plain_text = (
+                                    f"Meeting Room ID: {room['id']} \n"
+                                    f"Meeting Room Name: {room['name']} \n"
+                                    f"Capacity: {room['capacity']}\n"
+                                    f"Distance: {room['distance_m']} meters\n"
+                                    f"Utilization: {room['utilization_pct']}%\n"
+                                    f"Available: {room['available']}\n\n"
+                                    f"Explanation: {result['decision_explanation']}"
+                                )
+                                st.text(plain_text)
+                            # Persist context BEFORE rendering booking actions & floor plan
+                            st.session_state.selected_room_result = result
+                            st.session_state.selection_params = {
+                                'workstation_id': workstation_id,
+                                'meeting_date': meeting_date,
+                                'start_time': start_time,
+                                'duration_minutes': duration_minutes,
+                                'required_capacity': required_capacity,
+                                'room_id': result['selected_room']['id']
+                            }
+                            st.session_state.rooms_snapshot = rooms
+                            st.session_state.workstations_snapshot = workstations
+                            st.session_state.pop('booking_success', None)
+                            st.session_state.from_find_room_click = True  # mark this run to suppress persistent duplicate
+                            # Booking actions come directly after explanation (before floor plan)
+                            render_booking_actions(st.session_state.selection_params)
+                            highlight_room = rooms[rooms["id"] == result["selected_room"]["id"]].iloc[0]
+                            plot_floorplan(rooms, workstations, highlight_ws_id=workstation_id, highlight_room=highlight_room)
+
+# --- Persistent booking section (reordered: still shows explanation, booking actions before floor plan on reruns) ---
+if 'selected_room_result' in st.session_state and st.session_state.get('selected_room_result', {}).get('selected_room') and not st.session_state.get('from_find_room_click', False):
+    # Use stored snapshots for plotting
+    params = st.session_state.selection_params
+    rooms_snap = st.session_state.get('rooms_snapshot')
+    workstations_snap = st.session_state.get('workstations_snapshot')
+    result = st.session_state.selected_room_result
+    if rooms_snap is not None and workstations_snap is not None:
+        room = result['selected_room']
+        st.text(
+            f"Meeting Room ID: {room['id']} \n"
+            f"Meeting Room Name: {room['name']} \n"
+            f"Capacity: {room['capacity']}\n"
+            f"Distance: {room['distance_m']} meters\n"
+            f"Utilization: {room['utilization_pct']}%\n"
+            f"Available: {room['available']}\n\n"
+            f"Explanation: {result['decision_explanation']}"
+        )
+        render_booking_actions(params)
+        highlight_room = rooms_snap[rooms_snap["id"] == room["id"]].iloc[0]
+        plot_floorplan(rooms_snap, workstations_snap, highlight_ws_id=params['workstation_id'], highlight_room=highlight_room)
