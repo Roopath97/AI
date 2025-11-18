@@ -544,6 +544,7 @@ def calculate_room_score(room: pd.Series, workstation_pos: Tuple[float, float],
 # ---------------- Floor Plan Visualization ---------------- #
 
 def plot_floorplan(df_rooms, df_workstations, highlight_ws_id=None, highlight_room=None):
+    st.subheader("Meeting Room Floor Plan Map")
     fig, ax = plt.subplots(figsize=(10, 8))
     cmap = plt.get_cmap("viridis")
     norm = plt.Normalize(df_rooms["capacity"].min(), df_rooms["capacity"].max())
@@ -832,7 +833,7 @@ if start_time and end_time and end_time != start_time:
 else:
     st.warning("Please select valid start and end times!")
 
-import uuid
+
 # NOTE: portalocker optional; add to requirements.txt for robust cross-process locking.
 try:
     import portalocker  # type: ignore
@@ -1112,7 +1113,6 @@ if st.button("Find Room"):
                 if not validation_result["valid"]:
                     st.error("Input validation failed: " + "; ".join(validation_result["errors"]))
                 else:
-                    # NEW: Workstation conflict short-circuit BEFORE room suggestion
                     ws_conflict_now, ws_conflict_rows_now = workstation_has_conflict(
                         bookings,
                         workstation_id,
@@ -1122,14 +1122,11 @@ if st.button("Find Room"):
                     )
                     if ws_conflict_now and not ws_conflict_rows_now.empty:
                         st.warning(f"Workstation {workstation_id} already booked for this slot. Existing booking(s) shown below.")
-                        # Show existing booking details table for this workstation/time window
                         display_cols = [c for c in ["booking_id","room_id","date","start_time","end_time","duration_minutes","booked_attendees"] if c in ws_conflict_rows_now.columns]
-                        # Ensure end_time present for legacy rows
                         if "end_time" not in ws_conflict_rows_now.columns:
                             ws_conflict_rows_now = ws_conflict_rows_now.copy()
                             ws_conflict_rows_now["end_time"] = ws_conflict_rows_now.apply(lambda r: _compute_end_time(r["start_time"], int(r["duration_minutes"])) if pd.notna(r.get("duration_minutes")) else "", axis=1)
                         st.dataframe(ws_conflict_rows_now[display_cols].sort_values("start_time"))
-                        # Highlight first conflicting room on floorplan if available
                         conflict_room_id = ws_conflict_rows_now.iloc[0]["room_id"] if "room_id" in ws_conflict_rows_now.columns else None
                         highlight_room_df = rooms[rooms["id"] == conflict_room_id]
                         if not highlight_room_df.empty:
@@ -1137,11 +1134,10 @@ if st.button("Find Room"):
                         else:
                             highlight_room = None
                         plot_floorplan(rooms, workstations, highlight_ws_id=workstation_id, highlight_room=highlight_room)
-                        # Clear any previous selection & prevent booking actions
                         st.session_state.pop('selected_room_result', None)
                         st.session_state.pop('selection_params', None)
                         st.session_state.pop('booking_success', None)
-                        st.session_state.from_find_room_click = True  # suppress persistent section
+                        st.session_state.from_find_room_click = True 
                     else:
                         if enable_detailed_logging:
                             st.info(f"Detailed logging enabled (Level: {log_level}) - Check console for reasoning details")
@@ -1173,7 +1169,6 @@ if st.button("Find Room"):
                                     f"Explanation: {result['decision_explanation']}"
                                 )
                                 st.text(plain_text)
-                            # Persist context BEFORE rendering booking actions & floor plan
                             st.session_state.selected_room_result = result
                             st.session_state.selection_params = {
                                 'workstation_id': workstation_id,
@@ -1186,8 +1181,7 @@ if st.button("Find Room"):
                             st.session_state.rooms_snapshot = rooms
                             st.session_state.workstations_snapshot = workstations
                             st.session_state.pop('booking_success', None)
-                            st.session_state.from_find_room_click = True  # mark this run to suppress persistent duplicate
-                            # Booking actions come directly after explanation (before floor plan)
+                            st.session_state.from_find_room_click = True 
                             render_booking_actions(st.session_state.selection_params)
                             highlight_room = rooms[rooms["id"] == result["selected_room"]["id"]].iloc[0]
                             plot_floorplan(rooms, workstations, highlight_ws_id=workstation_id, highlight_room=highlight_room)
