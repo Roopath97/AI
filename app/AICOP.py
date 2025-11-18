@@ -4,11 +4,12 @@ import math
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Circle
 from typing import Tuple, Dict
+from datetime import datetime
 
 # -------- File Paths --------
-MEETING_ROOMS_CSV = "meeting_rooms.csv"
-WORKSTATIONS_CSV = "workstations1.csv"
-BOOKINGS_CSV = "bookings.csv"
+import os
+_d = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+MEETING_ROOMS_CSV, WORKSTATIONS_CSV, BOOKINGS_CSV = [os.path.join(_d, f) for f in ["meeting_rooms.csv", "workstations.csv", "bookings.csv"]]
 
 # ---------------- Utility Functions ---------------- #
 
@@ -183,47 +184,163 @@ def plot_floorplan(df_rooms, df_workstations, highlight_ws_id=None, highlight_ro
 
 # ---------------- Streamlit UI ---------------- #
 
+# ---------------- Streamlit UI ---------------- #
+
 st.title("🏢 Smart Meeting Room Selector ")
+
+def generate_time_options():
+    times = []
+    for hour in range(24):
+        for minute in [0, 30]:
+            times.append(f"{hour:02d}:{minute:02d}")
+    return times
+
+def get_default_time_index():
+    now = datetime.now()
+    current_minutes = now.hour * 60 + now.minute
+    
+    next_slot_minutes = ((current_minutes // 30) + 1) * 30
+    if next_slot_minutes >= 24 * 60:  
+        next_slot_minutes = 0
+    
+    return next_slot_minutes // 30
+
+def get_end_time_options(start_time: str, time_options: list) -> list:
+    """Get end time options that are after the start time"""
+    start_index = time_options.index(start_time)
+    end_options = time_options[start_index + 1:]
+    
+    if len(end_options) < 2:
+        next_day_options = [f"{hour:02d}:{minute:02d}" for hour in range(0, 6) for minute in [0, 30]]
+        end_options.extend(next_day_options)
+    
+    return end_options
+
+def get_default_end_time(start_time: str, time_options: list) -> str:
+    """Get default end time (30 minutes after start time)"""
+    start_index = time_options.index(start_time)
+    
+    if start_index + 1 < len(time_options):
+        return time_options[start_index + 1]
+    else:
+        return "00:00"
+
+def calculate_duration(start_time: str, end_time: str) -> tuple:
+    start_h, start_m = map(int, start_time.split(":"))
+    end_h, end_m = map(int, end_time.split(":"))
+    
+    start_minutes = start_h * 60 + start_m
+    end_minutes = end_h * 60 + end_m
+    
+    if end_minutes <= start_minutes:
+        end_minutes += 24 * 60
+    
+    duration_minutes = end_minutes - start_minutes
+    duration_hours = duration_minutes / 60
+    
+    return duration_minutes, duration_hours
+
+time_options = generate_time_options()
+default_start_index = get_default_time_index()
 
 workstation_id = st.text_input("Workstation ID", "WS-11")
 required_capacity = st.number_input("Required Capacity", min_value=1, value=4)
 meeting_date = st.date_input("Meeting Date").strftime("%Y-%m-%d")
-start_time = st.text_input("Start Time (HH:MM)", "13:00")
-duration_minutes = st.number_input("Duration (minutes)", min_value=15, value=45)
+
+col1, col2 = st.columns(2)
+with col1:
+    start_time = st.select_slider("Start Time", options=time_options, value=time_options[default_start_index])
+
+end_time_options = get_end_time_options(start_time, time_options)
+
+if 'previous_start_time' not in st.session_state:
+    st.session_state.previous_start_time = start_time
+
+if st.session_state.previous_start_time != start_time:
+    st.session_state.previous_start_time = start_time
+    default_end_time = get_default_end_time(start_time, time_options)
+    if 'end_time_key' not in st.session_state:
+        st.session_state.end_time_key = 0
+    st.session_state.end_time_key += 1
+
+with col2:
+    end_time_options = get_end_time_options(start_time, time_options)
+    
+    if len(end_time_options) >= 2:  # Ensure we have enough options for slider
+        default_end_time = get_default_end_time(start_time, time_options)
+        if default_end_time not in end_time_options:
+            default_end_time = end_time_options[0]
+        
+        end_time = st.select_slider(
+            "End Time", 
+            options=end_time_options, 
+            value=default_end_time,
+            key=f"end_time_{st.session_state.get('end_time_key', 0)}"
+        )
+    elif len(end_time_options) == 1:
+        # If only one option, use selectbox instead of slider
+        end_time = st.selectbox(
+            "End Time",
+            options=end_time_options,
+            index=0,
+            key=f"end_time_select_{st.session_state.get('end_time_key', 0)}"
+        )
+    else:
+        st.warning("No valid end times available")
+        end_time = start_time
+
+if start_time and end_time and end_time != start_time:
+    duration_minutes, duration_hours = calculate_duration(start_time, end_time)
+    if duration_minutes > 0:
+        start_h = int(start_time.split(":")[0])
+        end_h = int(end_time.split(":")[0])
+        next_day_text = " (next day)" if end_h < start_h else ""
+        
+        if duration_hours.is_integer():
+            st.info(f"📅 **Total booking duration:** {int(duration_hours)} hour(s){next_day_text}")
+        else:
+            st.info(f"📅 **Total booking duration:** {duration_hours:.1f} hours ({duration_minutes} minutes){next_day_text}")
+    else:
+        st.warning("⚠️ End time must be after start time!")
+else:
+    st.warning("⚠️ Please select valid start and end times!")
 
 if st.button("Find Room"):
-    rooms = pd.read_csv(MEETING_ROOMS_CSV)
-    workstations = pd.read_csv(WORKSTATIONS_CSV)
-    bookings = pd.read_csv(BOOKINGS_CSV)
-
-    rooms = compute_room_centers(normalize_columns(rooms))
-    workstations = normalize_columns(workstations)
-
-    result = select_room_strict(
-        rooms, workstations, bookings,
-        required_capacity, workstation_id,
-        meeting_date, start_time, duration_minutes
-    )
-
-    if result["selected_room"] is None:
-        st.error(result["decision_explanation"])
+    if start_time >= end_time:
+        st.error("End time must be after start time!")
     else:
-        st.success("✅ Suggested Meeting Room:")
-        if result["selected_room"]:
-            room = result["selected_room"]
-            plain_text = (
-                f"Meeting Room ID: {room['id']} \n"
-                f"Meeting Room Name: {room['name']} \n"
-                f"Capacity: {room['capacity']}\n"
-                f"Distance: {room['distance_m']} meters\n"
-                f"Utilization: {room['utilization_pct']}%\n"
-                f"Available: {room['available']}\n\n"
-                f"Explanation: {result['decision_explanation']}"
-            )
-            st.text(plain_text)
-        #st.write(result["selected_room"])
-        #st.write(f"**Explanation:** {result['decision_explanation']}")
+        duration_minutes, _ = calculate_duration(start_time, end_time)
+        
+        rooms = pd.read_csv(MEETING_ROOMS_CSV)
+        workstations = pd.read_csv(WORKSTATIONS_CSV)
+        bookings = pd.read_csv(BOOKINGS_CSV)
 
-        # Highlight selected room and workstation on floor plan
-        highlight_room = rooms[rooms["id"] == result["selected_room"]["id"]].iloc[0]
-        plot_floorplan(rooms, workstations, highlight_ws_id=workstation_id, highlight_room=highlight_room)
+        rooms = compute_room_centers(normalize_columns(rooms))
+        workstations = normalize_columns(workstations)
+
+        result = select_room_strict(
+            rooms, workstations, bookings,
+            required_capacity, workstation_id,
+            meeting_date, start_time, duration_minutes
+        )
+
+        if result["selected_room"] is None:
+            st.error(result["decision_explanation"])
+        else:
+            st.success("✅ Suggested Meeting Room:")
+            if result["selected_room"]:
+                room = result["selected_room"]
+                plain_text = (
+                    f"Meeting Room ID: {room['id']} \n"
+                    f"Meeting Room Name: {room['name']} \n"
+                    f"Capacity: {room['capacity']}\n"
+                    f"Distance: {room['distance_m']} meters\n"
+                    f"Utilization: {room['utilization_pct']}%\n"
+                    f"Available: {room['available']}\n\n"
+                    f"Explanation: {result['decision_explanation']}"
+                )
+                st.text(plain_text)
+
+            # Highlight selected room and workstation on floor plan
+            highlight_room = rooms[rooms["id"] == result["selected_room"]["id"]].iloc[0]
+            plot_floorplan(rooms, workstations, highlight_ws_id=workstation_id, highlight_room=highlight_room)
